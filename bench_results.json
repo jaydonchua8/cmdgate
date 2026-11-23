@@ -1,0 +1,26 @@
+{
+  "prefix globs": {
+    "caught": 147,
+    "risky": 1136,
+    "false_positives": 20,
+    "benign": 915
+  },
+  "substring globs": {
+    "caught": 587,
+    "risky": 1136,
+    "false_positives": 229,
+    "benign": 915
+  },
+  "cmdgate": {
+    "caught": 1136,
+    "risky": 1136,
+    "false_positives": 4,
+    "benign": 915
+  },
+  "exact_level": 1136,
+  "known_hard_caught": 1,
+  "known_hard_total": 10,
+  "median_us": 35,
+  "p99_us": 11155,
+  "hook_median_ms": 134
+}
