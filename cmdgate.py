@@ -1,321 +1,74 @@
-"""cmdgate: decide allow / warn / block for a shell command an AI coding agent wants to run.
+"""cmdgate: decide what to do with a shell command an AI coding agent wants to run.
 
-The command is parsed into the simple commands that would actually execute
-(through chains, pipes, wrappers like sudo and xargs, `bash -c`, eval, and
-command substitution) and each one is checked against structured rules.
+The command is parsed into the simple commands that would actually execute (see
+resolve.py) and each one is checked against structured rules in policy.json.
+Every rule carries a risk level (low, medium, high, critical). A tier turns the
+highest risk into an action: allow, warn, ask or block. The risk levels, tier
+names and the tier matrix follow the ones published in Unbound's open OACB
+baseline, so a decision here can be compared with that hook case by case.
 Standard library only.
 """
 import json
 import os
 import re
 import sys
+from urllib.parse import urlsplit
+
+from shparse import ParseError, lex  # noqa: F401  (lex is re-exported)
+from resolve import Analyzer, analyze  # noqa: F401
 
 LEVEL = {"allow": 0, "warn": 1, "block": 2}
-MAX_DEPTH = 8
-
-
-class ParseError(ValueError):
-    pass
-
-
-# ---------------------------------------------------------------- lexer
-
-_REDIR = re.compile(r"(?:\d+|&)?(?:>>|>&|>\||<<<|<<-?|<&|<>|>|<)")
-_OPS = ("&&", "||", ";;", "|&", ";", "|", "&", "\n", "(", ")")
-
-
-def _read_paren(s, i):
-    """s[i:] starts just after '$('. Return (inner, index after the matching ')')."""
-    depth, start, n = 1, i, len(s)
-    while i < n:
-        c = s[i]
-        if c == "\\":
-            i += 2
-            continue
-        if c == "'":
-            j = s.find("'", i + 1)
-            if j < 0:
-                raise ParseError("unterminated single quote")
-            i = j + 1
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                return s[start:i], i + 1
-        i += 1
-    raise ParseError("unterminated $(")
-
-
-def _read_tick(s, i):
-    start, n = i, len(s)
-    while i < n:
-        if s[i] == "\\":
-            i += 2
-            continue
-        if s[i] == "`":
-            return s[start:i], i + 1
-        i += 1
-    raise ParseError("unterminated backtick")
-
-
-def lex(s):
-    """Return tokens: ("w", text, [substitutions]), ("op", text) or ("redir", text)."""
-    toks, buf, subs = [], None, []
-    i, n = 0, len(s)
-
-    def flush():
-        nonlocal buf, subs
-        if buf is not None:
-            toks.append(("w", buf, subs))
-            buf, subs = None, []
-
-    while i < n:
-        c = s[i]
-        if c == "\\":
-            if i + 1 >= n:
-                raise ParseError("trailing backslash")
-            if s[i + 1] != "\n":
-                buf = (buf or "") + s[i + 1]
-            i += 2
-        elif c == "'":
-            j = s.find("'", i + 1)
-            if j < 0:
-                raise ParseError("unterminated single quote")
-            buf = (buf or "") + s[i + 1:j]
-            i = j + 1
-        elif c == '"':
-            buf = buf or ""
-            i += 1
-            while True:
-                if i >= n:
-                    raise ParseError("unterminated double quote")
-                d = s[i]
-                if d == '"':
-                    i += 1
-                    break
-                if d == "\\" and i + 1 < n and s[i + 1] in '"\\$`\n':
-                    if s[i + 1] != "\n":
-                        buf += s[i + 1]
-                    i += 2
-                elif d == "$" and s[i + 1:i + 2] == "(":
-                    inner, i = _read_paren(s, i + 2)
-                    subs.append(inner)
-                    buf += "$(" + inner + ")"
-                elif d == "`":
-                    inner, i = _read_tick(s, i + 1)
-                    subs.append(inner)
-                    buf += "`" + inner + "`"
-                else:
-                    buf += d
-                    i += 1
-        elif c == "$" and s[i + 1:i + 2] == "(":
-            inner, i = _read_paren(s, i + 2)
-            subs.append(inner)
-            buf = (buf or "") + "$(" + inner + ")"
-        elif c == "`":
-            inner, i = _read_tick(s, i + 1)
-            subs.append(inner)
-            buf = (buf or "") + "`" + inner + "`"
-        elif c in " \t":
-            flush()
-            i += 1
-        elif c == "#" and buf is None:
-            j = s.find("\n", i)
-            i = n if j < 0 else j
-        else:
-            m = _REDIR.match(s, i) if (buf is None or c in "<>") else None
-            if m:
-                flush()
-                toks.append(("redir", m.group(0)))
-                i = m.end()
-                continue
-            for op in _OPS:
-                if s.startswith(op, i):
-                    flush()
-                    toks.append(("op", op))
-                    i += len(op)
-                    break
-            else:
-                buf = (buf or "") + c
-                i += 1
-    flush()
-    return toks
-
-
-def pipelines(tokens):
-    """Group tokens into pipelines, each a list of {"argv", "redirs", "subs"}."""
-    out, pipe = [], []
-    cmd = {"argv": [], "redirs": [], "subs": []}
-    pending = None
-
-    def end_cmd():
-        nonlocal cmd
-        if cmd["argv"] or cmd["redirs"] or cmd["subs"]:
-            pipe.append(cmd)
-        cmd = {"argv": [], "redirs": [], "subs": []}
-
-    for t in tokens:
-        if t[0] == "w":
-            cmd["subs"].extend(t[2])
-            if pending is not None:
-                cmd["redirs"].append((pending, t[1]))
-                pending = None
-            else:
-                cmd["argv"].append(t[1])
-        elif t[0] == "redir":
-            pending = t[1]
-        else:
-            pending = None
-            end_cmd()
-            if t[1] not in ("|", "|&"):
-                if pipe:
-                    out.append(pipe)
-                pipe = []
-    end_cmd()
-    if pipe:
-        out.append(pipe)
-    return out
-
-
-# ---------------------------------------------------------------- resolving what really runs
-
-_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
-_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}
-SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
-# wrapper -> options that take a value
-WRAPPERS = {
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"}, "doas": {"-u", "-C"},
-    "env": {"-u", "-C"}, "nohup": set(), "time": {"-f", "-o"}, "command": set(), "exec": {"-a"},
-    "builtin": set(), "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "timeout": {"-s", "-k"},
-    "stdbuf": {"-i", "-o", "-e"}, "xargs": {"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"},
-    "busybox": set(), "setsid": set(), "watch": {"-n"},
+RISK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+# tier -> risk -> action. Same matrix as _tier_action in OACB's oacb-enforce-core.sh.
+TIERS = {
+    "shadow": {"low": "allow", "medium": "allow", "high": "allow", "critical": "allow"},
+    "receipts": {"low": "allow", "medium": "warn", "high": "warn", "critical": "warn"},
+    "baseline": {"low": "allow", "medium": "allow", "high": "ask", "critical": "block"},
+    "strict": {"low": "allow", "medium": "warn", "high": "block", "critical": "block"},
+    "paranoid": {"low": "allow", "medium": "block", "high": "block", "critical": "block"},
 }
-# command -> options whose next argument is a value, so it is not a positional
-VALUE_FLAGS = {
-    "git": {"-C", "-c"},
-    "kubectl": {"-n", "--namespace", "--context", "--kubeconfig", "-l", "--selector"},
-    "psql": {"-h", "-U", "-d", "-p"},
-    "mysql": {"-h", "-u", "-P", "-D"},
-    "aws": {"--profile", "--region", "--endpoint-url"},
-    "docker": {"-H", "--context"},
-}
+UNPARSEABLE_RISK = "high"
+MAX_INPUT_BYTES = 131072
+
+_MATCH_KEYS = {"cmd", "cmd_re", "sub", "flags", "not_flags", "pos_re", "pos_from", "first_pos_re", "args_re", "argv_re",
+               "downstream", "upstream", "redir_re", "via_any", "dyn_name", "glob_name", "dyn_args",
+               "procsub_cmd", "untrusted_url", "min_separators"}
+_REGEX_KEYS = ("cmd_re", "pos_re", "first_pos_re", "args_re", "argv_re", "redir_re")
+_URL = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
 
 
-def _leaf(argv, redirs, via):
-    name = os.path.basename(argv[0]) if argv else ""
-    args = argv[1:]
-    flags, pos = set(), []
-    vf = VALUE_FLAGS.get(name, ())
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            pos.extend(args[i + 1:])
-            break
-        if a.startswith("--"):
-            flags.add(a.split("=", 1)[0])
-            if a in vf:
-                i += 1
-        elif a.startswith("-") and len(a) > 1:
-            if a in vf:
-                i += 1
-            else:
-                flags.add(a)
-                flags.update("-" + ch for ch in a[1:])
-        else:
-            pos.append(a)
-        i += 1
-    return {"name": name, "argv": argv, "args": args, "flags": flags, "pos": pos,
-            "redirs": redirs, "downstream": [], "via": list(via)}
+def _legacy(risk):
+    return "block" if risk == "critical" else "allow" if risk == "low" else "warn"
 
-
-def _resolve(argv, redirs, via, depth):
-    """Return leaves for one simple command. The first leaf is the command itself."""
-    argv = list(argv)
-    via = tuple(via)
-    while argv:
-        if _ASSIGN.match(argv[0]) or argv[0] in _KEYWORDS:
-            argv.pop(0)
-            continue
-        name = os.path.basename(argv[0])
-        if name not in WRAPPERS or len(argv) == 1:
-            break
-        takes = WRAPPERS[name]
-        j = 1
-        while j < len(argv):
-            a = argv[j]
-            if a == "--":
-                j += 1
-                break
-            if a.startswith("-") and len(a) > 1:
-                j += 2 if a in takes else 1
-            elif name == "env" and _ASSIGN.match(a):
-                j += 1
-            else:
-                break
-        if name == "timeout" and j < len(argv):
-            j += 1
-        if j >= len(argv):
-            break
-        via += (name,)
-        argv = argv[j:]
-    leaves = [_leaf(argv, redirs, via)]
-    if not argv:
-        return leaves
-    name, args = leaves[0]["name"], argv[1:]
-    if name in SHELLS:
-        for k, a in enumerate(args):
-            if a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
-                script = next((x for x in args[k + 1:] if not x.startswith("-")), None)
-                if script is not None:
-                    leaves += analyze(script, via + (name + " -c",), depth + 1)
-                break
-    elif name == "eval" and args:
-        leaves += analyze(" ".join(args), via + ("eval",), depth + 1)
-    elif name == "find":
-        k = 0
-        while k < len(args):
-            if args[k] in ("-exec", "-execdir", "-ok", "-okdir"):
-                end = k + 1
-                while end < len(args) and args[end] not in (";", "+"):
-                    end += 1
-                if end > k + 1:
-                    leaves += _resolve(args[k + 1:end], [], via + ("find " + args[k],), depth + 1)
-                k = end
-            k += 1
-    return leaves
-
-
-def analyze(text, via=(), depth=0):
-    """Return every simple command that `text` would run, as a flat list of leaves."""
-    if depth > MAX_DEPTH:
-        raise ParseError("nesting too deep")
-    leaves = []
-    for pipe in pipelines(lex(text)):
-        members = [_resolve(c["argv"], c["redirs"], via, depth) for c in pipe]
-        for k, m in enumerate(members):
-            m[0]["downstream"] = [x[0]["name"] for x in members[k + 1:]]
-            leaves += m
-        for c in pipe:
-            for inner in c["subs"]:
-                leaves += analyze(inner, tuple(via) + ("$()",), depth + 1)
-    return leaves
-
-
-# ---------------------------------------------------------------- policy
 
 class Policy:
     def __init__(self, rules):
         self.rules = []
+        seen = set()
         for r in rules:
-            if r["action"] not in ("warn", "block"):
-                raise ValueError("rule %s: action must be warn or block" % r.get("id"))
+            rid = r.get("id")
+            if not rid or rid in seen:
+                raise ValueError("rule id missing or repeated: %r" % rid)
+            seen.add(rid)
             c = dict(r)
-            for key in ("pos_re", "args_re", "redir_re", "cmd_re"):
+            if "risk" not in c:  # first-version rules only had an action
+                if c.get("action") not in ("warn", "block"):
+                    raise ValueError("rule %s: needs a risk, or an action of warn or block" % rid)
+                c["risk"] = "critical" if c["action"] == "block" else "high"
+            if c["risk"] not in RISK:
+                raise ValueError("rule %s: unknown risk %r" % (rid, c["risk"]))
+            unknown = set(c) - _MATCH_KEYS - {"id", "why", "risk", "action", "oacb"}
+            if unknown:
+                raise ValueError("rule %s: unknown keys %s" % (rid, sorted(unknown)))
+            if not set(c) & (_MATCH_KEYS - {"pos_from"}):
+                raise ValueError("rule %s: matches every command" % rid)
+            for key in _REGEX_KEYS:
                 if key in c:
-                    c[key] = re.compile(c[key])
+                    try:
+                        c[key] = re.compile(c[key])
+                    except re.error as e:
+                        raise ValueError("rule %s: bad %s: %s" % (rid, key, e))
+            c.setdefault("why", rid)
             self.rules.append(c)
 
     @classmethod
@@ -325,7 +78,14 @@ class Policy:
             return cls(json.load(f)["rules"])
 
     @staticmethod
-    def _match(r, leaf):
+    def _untrusted(leaf, trusted):
+        hosts = [urlsplit(a).hostname or "" for a in leaf["args"] if _URL.match(a)]
+        return not hosts or any(h.lower() not in trusted for h in hosts)
+
+    @classmethod
+    def _match(cls, r, leaf):
+        if "min_separators" in r:
+            return False  # checked once per command, not per leaf
         if "cmd" in r and leaf["name"] not in r["cmd"]:
             return False
         if "cmd_re" in r and not r["cmd_re"].search(leaf["name"]):
@@ -337,68 +97,173 @@ class Policy:
                 return False
         if leaf["flags"].intersection(r.get("not_flags", ())):
             return False
-        if "pos_re" in r and not any(r["pos_re"].search(p) for p in leaf["pos"]):
+        if "pos_re" in r and not any(r["pos_re"].search(p) for p in leaf["pos"][r.get("pos_from", 0):]):
+            return False
+        if "first_pos_re" in r and not (leaf["pos"] and r["first_pos_re"].search(leaf["pos"][0])):
             return False
         if "args_re" in r and not r["args_re"].search(" ".join(leaf["args"])):
             return False
+        if "argv_re" in r and not r["argv_re"].search(" ".join(leaf["argv"])):
+            return False
         if "downstream" in r and not set(leaf["downstream"]).intersection(r["downstream"]):
+            return False
+        if "upstream" in r and not set(leaf["upstream"]).intersection(r["upstream"]):
             return False
         if "redir_re" in r and not any(r["redir_re"].search(t) for _, t in leaf["redirs"]):
             return False
+        if "via_any" in r and not set(leaf["via"]).intersection(r["via_any"]):
+            return False
+        for key in ("dyn_name", "glob_name", "dyn_args"):
+            if key in r and bool(leaf[key]) != bool(r[key]):
+                return False
+        if "procsub_cmd" in r and not any(
+                re.match(r"\s*(\S*/)?(%s)\b" % "|".join(map(re.escape, r["procsub_cmd"])), p)
+                for p in leaf["procsubs"]):
+            return False
+        if "untrusted_url" in r and not cls._untrusted(leaf, r["untrusted_url"]):
+            return False
         return True
 
-    def check(self, command):
-        """Return {"action", "findings", "commands"} for one command string."""
+    def _finding(self, r, command, via=(), notes=()):
+        f = {"rule": r["id"], "risk": r["risk"], "action": _legacy(r["risk"]), "why": r["why"],
+             "command": command, "via": list(via)}
+        if r.get("oacb"):
+            f["oacb"] = r["oacb"]
+        if notes:
+            f["resolved"] = list(notes)
+        return f
+
+    def check(self, command, cwd=None, follow_files=False):
+        """Return {"action", "risk", "commands", "findings"} for one command string.
+
+        action is the tier-free summary: block for critical, warn for medium or high.
+        Use decide() to turn the result into a per-tier action.
+        """
+        an = Analyzer(cwd, follow_files)
         try:
-            leaves = analyze(command)
-        except ParseError as e:
+            leaves = an.analyze(command)
+        except (ParseError, RecursionError) as e:
             # A command I cannot parse is not one I can call safe.
-            return {"action": "warn", "commands": 0, "findings": [
-                {"rule": "unparseable", "action": "warn", "why": "could not parse: %s" % e,
-                 "command": command, "via": []}]}
+            return {"action": "warn", "risk": UNPARSEABLE_RISK, "commands": 0, "findings": [
+                {"rule": "unparseable", "risk": UNPARSEABLE_RISK, "action": "warn",
+                 "why": "could not parse: %s" % e, "command": command, "via": []}]}
         findings = []
         for leaf in leaves:
             for r in self.rules:
                 if self._match(r, leaf):
-                    findings.append({"rule": r["id"], "action": r["action"], "why": r["why"],
-                                     "command": " ".join(leaf["argv"]), "via": leaf["via"]})
-        action = max((f["action"] for f in findings), key=LEVEL.get, default="allow")
-        return {"action": action, "commands": len(leaves), "findings": findings}
+                    findings.append(self._finding(r, " ".join(leaf["argv"]), leaf["via"], leaf["notes"]))
+        for r in self.rules:
+            if "min_separators" in r and an.separators >= r["min_separators"]:
+                f = self._finding(r, command[:200])
+                f["why"] = "%s (%d separators)" % (r["why"], an.separators)
+                findings.append(f)
+        risk = max((f["risk"] for f in findings), key=RISK.get, default="low")
+        out = {"action": _legacy(risk) if findings else "allow", "risk": risk if findings else "low",
+               "commands": len(leaves), "findings": findings}
+        if an.followed:
+            out["files_read"] = an.followed
+        return out
 
 
-def hook_response(policy, event):
+def decide(result, tier="baseline", prod=False):
+    """Turn a check() result into allow / warn / ask / block for a tier.
+
+    prod mirrors OACB's promote-on-context: in a production context high becomes critical.
+    """
+    if tier not in TIERS:
+        raise ValueError("unknown tier %r" % tier)
+    risk = result["risk"]
+    if prod and risk == "high":
+        risk = "critical"
+    if not result["findings"]:
+        return "allow", "low"
+    return TIERS[tier][risk], risk
+
+
+def top_findings(result):
+    return [f for f in result["findings"] if f["risk"] == max(
+        (g["risk"] for g in result["findings"]), key=RISK.get)]
+
+
+def reason_text(result):
+    return "; ".join("%s: %s [%s]" % (f["rule"], f["why"], f["command"]) for f in top_findings(result))
+
+
+def _deny(reason, decision="deny"):
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": reason}}
+
+
+def hook_response(policy, event, tier="baseline", follow_files=False):
     """Map a PreToolUse hook event to a response dict, or None to stay out of the way."""
-    command = (event.get("tool_input") or {}).get("command")
-    if not isinstance(command, str):
+    if not isinstance(event, dict):
+        return _deny("cmdgate: hook input was not a JSON object")
+    command = (event.get("tool_input") or {}).get("command") if isinstance(event.get("tool_input"), dict) else None
+    if event.get("tool_name") not in (None, "Bash") or not isinstance(command, str):
         return None
-    d = policy.check(command)
-    if d["action"] == "allow":
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
+    d = policy.check(command, cwd, follow_files)
+    action, _ = decide(d, tier)
+    if action in ("allow", "warn"):
         return None  # never auto-approve; the agent's normal permission flow still applies
-    top = [f for f in d["findings"] if f["action"] == d["action"]]
-    reason = "; ".join("%s: %s [%s]" % (f["rule"], f["why"], f["command"]) for f in top)
-    return {"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny" if d["action"] == "block" else "ask",
-        "permissionDecisionReason": reason}}
+    return _deny(reason_text(d), "deny" if action == "block" else "ask")
+
+
+def hook_main(policy, raw, tier="baseline", follow_files=False):
+    """Hook entry point that fails closed: bad input becomes a deny, not a crash."""
+    if len(raw.encode("utf-8", "replace")) > MAX_INPUT_BYTES:
+        return _deny("cmdgate: hook input larger than %d bytes" % MAX_INPUT_BYTES)
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return _deny("cmdgate: hook input was not valid JSON")
+    try:
+        return hook_response(policy, event, tier, follow_files)
+    except Exception as e:  # a bug in the checker must not turn into a silent allow
+        return _deny("cmdgate: internal error (%s); blocked to be safe" % type(e).__name__)
+
+
+def _take(args, flag, default=None):
+    if flag in args:
+        k = args.index(flag)
+        if k + 1 >= len(args):
+            raise SystemExit("%s needs a value" % flag)
+        value = args[k + 1]
+        del args[k:k + 2]
+        return value
+    return default
+
+
+USAGE = ("usage: cmdgate.py [--policy FILE] [--tier TIER] [--cwd DIR] check '<command>'\n"
+         "       cmdgate.py [--policy FILE] [--tier TIER] [--no-follow] hook < event.json")
 
 
 def main(argv):
     args = list(argv)
-    path = None
-    if "--policy" in args:
-        k = args.index("--policy")
-        path = args[k + 1]
-        del args[k:k + 2]
+    path = _take(args, "--policy")
+    tier = _take(args, "--tier", "baseline")
+    cwd = _take(args, "--cwd")
+    follow = "--no-follow" not in args
+    args = [a for a in args if a != "--no-follow"]
+    if tier not in TIERS:
+        print("unknown tier %r (choose from %s)" % (tier, ", ".join(TIERS)), file=sys.stderr)
+        return 64
     if len(args) == 2 and args[0] == "check":
-        d = Policy.load(path).check(args[1])
+        d = Policy.load(path).check(args[1], cwd, follow_files=cwd is not None)
+        d["tier"], d["decision"] = tier, decide(d, tier)[0]
         print(json.dumps(d, indent=2))
         return LEVEL[d["action"]]
     if args == ["hook"]:
-        resp = hook_response(Policy.load(path), json.load(sys.stdin))
+        try:
+            policy = Policy.load(path)
+        except (OSError, ValueError, KeyError) as e:
+            print(json.dumps(_deny("cmdgate: policy could not be loaded (%s)" % e)))
+            return 0
+        resp = hook_main(policy, sys.stdin.read(), tier, follow)
         if resp:
             print(json.dumps(resp))
         return 0
-    print("usage: cmdgate.py [--policy FILE] check '<command>' | hook < event.json", file=sys.stderr)
+    print(USAGE, file=sys.stderr)
     return 64
 
 

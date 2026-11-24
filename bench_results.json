@@ -1,26 +1,116 @@
 {
-  "prefix globs": {
-    "caught": 147,
-    "risky": 1136,
-    "false_positives": 20,
-    "benign": 915
+  "dev": {
+    "prefix globs": {
+      "caught": 147,
+      "risky": 1136,
+      "false_positives": 20,
+      "benign": 915
+    },
+    "substring globs": {
+      "caught": 587,
+      "risky": 1136,
+      "false_positives": 229,
+      "benign": 915
+    },
+    "cmdgate": {
+      "caught": 1136,
+      "risky": 1136,
+      "false_positives": 0,
+      "benign": 915
+    },
+    "exact_level": 1136,
+    "benign_stopped_at_baseline": 0,
+    "known_hard_caught": 9,
+    "known_hard_total": 10
   },
-  "substring globs": {
-    "caught": 587,
-    "risky": 1136,
-    "false_positives": 229,
-    "benign": 915
+  "heldout_first_run_recorded": {
+    "substring globs": {
+      "caught": 263,
+      "risky": 800,
+      "false_positives": 136,
+      "benign": 800
+    },
+    "first version": {
+      "caught": 379,
+      "risky": 800,
+      "false_positives": 30,
+      "benign": 800
+    },
+    "cmdgate, frozen": {
+      "caught": 764,
+      "risky": 800,
+      "false_positives": 5,
+      "benign": 800
+    }
   },
-  "cmdgate": {
-    "caught": 1136,
-    "risky": 1136,
-    "false_positives": 4,
-    "benign": 915
+  "heldout_after_fixes": {
+    "prefix globs": {
+      "caught": 23,
+      "risky": 800,
+      "false_positives": 9,
+      "benign": 800
+    },
+    "substring globs": {
+      "caught": 263,
+      "risky": 800,
+      "false_positives": 136,
+      "benign": 800
+    },
+    "cmdgate": {
+      "caught": 800,
+      "risky": 800,
+      "false_positives": 0,
+      "benign": 800
+    },
+    "exact_level": 779,
+    "benign_stopped_at_baseline": 0
   },
-  "exact_level": 1136,
-  "known_hard_caught": 1,
-  "known_hard_total": 10,
-  "median_us": 35,
-  "p99_us": 11155,
-  "hook_median_ms": 134
+  "second_sample": {
+    "prefix globs": {
+      "caught": 17,
+      "risky": 800,
+      "false_positives": 8,
+      "benign": 800
+    },
+    "substring globs": {
+      "caught": 268,
+      "risky": 800,
+      "false_positives": 134,
+      "benign": 800
+    },
+    "cmdgate": {
+      "caught": 799,
+      "risky": 800,
+      "false_positives": 0,
+      "benign": 800
+    },
+    "exact_level": 781,
+    "benign_stopped_at_baseline": 0
+  },
+  "timing": {
+    "median_us": 84,
+    "p99_us": 12395,
+    "hook_median_ms": 193
+  },
+  "oacb_conformance": {
+    "cases": 71,
+    "checks": 93,
+    "exit_agree": 91,
+    "full_agree": 85,
+    "stricter": [
+      "cat-aws-credentials-bash-RESIDUAL",
+      "inverseprompt-echo-RESIDUAL"
+    ],
+    "looser": []
+  },
+  "oacb_false_positive_corpus_baseline": {
+    "commands": 255,
+    "stopped": 0,
+    "warned": 0
+  },
+  "oacb_false_positive_corpus_strict": {
+    "commands": 255,
+    "stopped": 0,
+    "warned": 2
+  }
 }
